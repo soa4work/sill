@@ -1,5 +1,7 @@
 import SwiftUI
 import Combine
+import AVFoundation
+import Speech
 import StreamProtocol
 
 // MARK: - Palette
@@ -232,6 +234,9 @@ struct StreamScreen: View {
     /// Up here, like the panel, so a rotation keeps it. An outside sill://pair link shows the same
     /// overlay with its confirmation.
     @State private var pairingOverlay = false
+    /// Landscape: the top bar is folded away and the stream takes the whole screen; a small handle
+    /// at the top of the stream brings it back. Up here so a rotation keeps it.
+    @State private var barHidden = false
     /// The DEBUG harness's stand-in for the camera (the simulator has none); nil on a device.
     private var scannerOverride: CodeScanner.Mode? = nil
     @Environment(\.scenePhase) private var scenePhase
@@ -380,6 +385,13 @@ struct StreamScreen: View {
                         .frame(width: panel.width, height: panel.height,
                                alignment: corner == .topTrailing ? .topTrailing : .bottomTrailing)
                         .position(x: panel.midX, y: panel.midY)
+                        .transition(.opacity)
+                }
+                // Dictation and Delete in landscape: text without the whole keyboard up. In the trailing
+                // safe-area margin, off the picture, where it is wide enough (an iPhone's); else over the
+                // stream's edge. A sibling after the layouts, as the chip is, so they take their touches.
+                if layout == .landscape, !drawerOpen, !settingsOpen, tour == nil, !overlayShown {
+                    FloatingTypingButtons(send: { client.sendInput($0) }, margin: geo.safeAreaInsets.trailing)
                         .transition(.opacity)
                 }
                 // The tour: a sibling above the layouts, as the pairing overlay is, and under it: an
@@ -1314,19 +1326,33 @@ struct StreamScreen: View {
         // The book pose (docs/iphone-duo-plan.md, (a)): nothing on the fold's band; elsewhere as before.
         let (bar, stripWidth) = plain.clearing(fold, width: width)
         return VStack(spacing: 0) {
+            if !barHidden {
             TopBar(client: client, metrics: bar, stripWidth: stripWidth, drawerOpen: $drawerOpen,
                    keyboardShown: $keyboardShown,
                    textScale: $textScale, scaleOpen: $scaleOpen, windowMenu: $windowMenu,
                    settingsOpen: settingsOpen,
                    // Apps, Menus, Aa, Keyboard, Desktop, Settings, and the strip. The Mac's sound has no
                    // button: Send Audio and Mute are the Settings panel's switches (Noah, 2026-10-27).
-                   menusFit: MacMenuButton.fits(width: width - 2 * bar.padding, buttons: 6, buttonWidth: bar.buttonWidth,
+                   menusFit: MacMenuButton.fits(width: width - 2 * bar.padding, buttons: 7, buttonWidth: bar.buttonWidth,
                                                 gap: bar.gap, thumbWidth: bar.thumbWidth),
                    toggleKeyboard: { overlay.toggleKeyboard() },
                    setSettings: { setSettings($0, restoreKeyboard: $1) },
-                   menusOpened: menusOpened, menusClosed: menusClosed)
+                   menusOpened: menusOpened, menusClosed: menusClosed,
+                   hideBar: hideBar)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
             contentArea(bar: bar)
         }
+        .statusBarHidden(barHidden)
+    }
+
+    /// Folds the top bar away; what hangs from it (the drawer, the Settings panel, the Aa ruler,
+    /// a thumbnail's lights) closes first.
+    private func hideBar() {
+        setSettings(false)
+        closeWindowMenu()
+        scaleOpen = false
+        withAnimation(.easeOut(duration: 0.2)) { drawerOpen = false; barHidden = true }
     }
 
     /// `largerKeyboard`: Larger Picture's keyboard on a phone (see `body`), nil otherwise.
@@ -1418,6 +1444,26 @@ struct StreamScreen: View {
                     .padding(.trailing, bar.padding)
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .transition(settingsTransition())
+            }
+
+            // The bar folded away: a small handle at the top centre brings it back. A sibling after
+            // the input view, as the drawer is, so it takes its tap over the stream.
+            if barHidden {
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { barHidden = false }
+                } label: {
+                    Image(systemName: "chevron.compact.down")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Palette.text)
+                        .frame(width: 56, height: 22)
+                        .background(Palette.bar.opacity(0.7), in: Capsule())
+                        .frame(width: 88, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Show the toolbar")
+                .frame(maxWidth: .infinity, alignment: .top)
+                .transition(.opacity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1579,6 +1625,8 @@ private struct TopBar: View {
     /// The Menus pull-down opened and went (see `StreamScreen.menusOpened`).
     let menusOpened: () -> Void
     let menusClosed: () -> Void
+    /// Folds the bar away (StreamScreen.hideBar).
+    let hideBar: () -> Void
 
     var body: some View {
         HStack(spacing: metrics.gap) {
@@ -1644,6 +1692,12 @@ private struct TopBar: View {
                 .opacity(scaleOpen ? 0 : 1)
                 .allowsHitTesting(!scaleOpen)
                 .tourTarget(.settings)
+
+            button(open: false, symbol: "chevron.up", label: "Hide",
+                   accessibilityLabel: "Hide the toolbar",
+                   action: hideBar)
+                .opacity(scaleOpen ? 0 : 1)
+                .allowsHitTesting(!scaleOpen)
         }
         .animation(.easeOut(duration: 0.16), value: scaleOpen)
         .animation(.easeOut(duration: 0.18), value: client.menus.hasMenus)
@@ -2612,5 +2666,236 @@ extension PhonePortraitLayout.Streaming {
         case .desktop: self = .desktop
         case .window: self = .window
         }
+    }
+}
+
+// MARK: - Floating dictation and delete (landscape)
+
+/// The mic (hold to talk; the phrase goes to the Mac as typed text on release) and Delete (one
+/// backspace a tap, the Mac repeats it while held; right after a dictation it takes the whole phrase
+/// back).
+struct FloatingTypingButtons: View {
+    let send: (InputEvent) -> Void
+    /// The screen's trailing safe-area inset: the buttons sit in it when it holds them.
+    let margin: CGFloat
+    @StateObject private var dictation = Dictation()
+    /// Where the person dragged the pair to by its grip: points below the screen's middle, kept.
+    @AppStorage("floatingTypingOffset") private var offset: Double = 0
+    @State private var dragStart: Double? = nil
+    /// Characters of the last dictated phrase Delete takes back at once, and until when.
+    @State private var undo: (count: Int, until: Double)? = nil
+    @State private var deleteHeld = false
+
+    /// Grip, mic and Delete stacked: their height, and the circles' size.
+    private static let stackHeight: CGFloat = 24 + 10 + 48 + 14 + 48
+    private static let size: CGFloat = 48
+
+    var body: some View {
+        // The whole screen, so the pair can sit in the margin; its empty room takes no touch.
+        GeometryReader { full in
+            let inMargin = margin >= Self.size + 4
+            let x = inMargin ? full.size.width - margin / 2 : full.size.width - margin - 8 - 14 - Self.size / 2
+            let limit = max(0, (full.size.height - Self.stackHeight) / 2 - 12)
+            let y = full.size.height / 2 + min(max(offset, -limit), limit)
+            ZStack {
+                if dictation.listening {
+                    Text(dictation.partial.isEmpty ? "Listening…" : dictation.partial)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Palette.text)
+                        .lineLimit(2)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(Palette.bar.opacity(0.85), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .frame(width: 260, alignment: .trailing)
+                        .position(x: x - Self.size / 2 - 10 - 130, y: y)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+                buttons(limit: limit)
+                    .position(x: x, y: y)
+            }
+        }
+        .ignoresSafeArea()
+        .animation(.easeOut(duration: 0.15), value: dictation.listening)
+        .onAppear {
+            dictation.deliver = { phrase in
+                guard !phrase.isEmpty else { return }
+                let text = phrase + " "
+                send(.text(text))
+                undo = (text.count, ProcessInfo.processInfo.systemUptime + 5)
+            }
+        }
+    }
+
+    private func buttons(limit: CGFloat) -> some View {
+        VStack(spacing: 10) {
+            // The grip: drag it up or down the edge to uncover what is under the pair.
+            Capsule()
+                .fill(Color.white.opacity(0.35))
+                .frame(width: 26, height: 5)
+                .frame(width: Self.size, height: 24)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 2)
+                    .onChanged { g in
+                        let start = dragStart ?? min(max(offset, -limit), limit)
+                        dragStart = start
+                        offset = min(max(start + g.translation.height, -limit), limit)
+                    }
+                    .onEnded { _ in dragStart = nil })
+                .accessibilityHidden(true)
+            VStack(spacing: 14) {
+            circle(symbol: "mic.fill", on: dictation.listening)
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged { _ in if !dictation.held { dictation.start() } }
+                    .onEnded { _ in dictation.stop() })
+                .accessibilityLabel("Dictate")
+                .accessibilityHint("Hold and speak; the text is typed on the Mac when you let go")
+                .accessibilityAddTraits(.isButton)
+            circle(symbol: "delete.left", on: deleteHeld)
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged { _ in deleteDown() }
+                    .onEnded { _ in deleteUp() })
+                .accessibilityLabel("Delete")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { send(.text("\u{8}")) }
+            }
+        }
+    }
+
+    private func deleteDown() {
+        guard !deleteHeld else { return }
+        deleteHeld = true
+        if let u = undo, ProcessInfo.processInfo.systemUptime < u.until {
+            // The phrase just dictated, at once; the key is not held down meanwhile.
+            send(.text(String(repeating: "\u{8}", count: u.count)))
+            undo = nil
+            return
+        }
+        undo = nil
+        KeyChord.down(Self.backspace, with: []).forEach(send)
+    }
+
+    private func deleteUp() {
+        guard deleteHeld else { return }
+        deleteHeld = false
+        // The phrase's take-back sent no key down; an up for it does no harm on the Mac.
+        KeyChord.up(Self.backspace, with: []).forEach(send)
+    }
+
+    /// Delete (Backspace), HID usage 0x2A.
+    private static let backspace: UInt16 = 0x2A
+
+    private func circle(symbol: String, on: Bool) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 20, weight: .medium))
+            .foregroundStyle(Palette.text)
+            .frame(width: 48, height: 48)
+            .background(on ? Color.red.opacity(0.85) : Palette.bar.opacity(0.72), in: Circle())
+            .overlay(Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+            .contentShape(Circle())
+    }
+}
+
+/// Speech to text on the device (Speech framework, on-device where the language allows), the
+/// device's language. iOS offers no way to start the keyboard's own dictation without the keyboard.
+@MainActor
+final class Dictation: ObservableObject {
+    @Published private(set) var listening = false
+    @Published private(set) var partial = ""
+    /// The finger is on the mic: the permission prompts' answers start listening only while it still is.
+    private(set) var held = false
+    /// The phrase, once, when the recognition ends.
+    var deliver: (String) -> Void = { _ in }
+
+    private let engine = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    /// Which listening a late callback or the stop's timeout belongs to: never the next one's.
+    private var run = 0
+
+    func start() {
+        held = true
+        SFSpeechRecognizer.requestAuthorization { status in
+            guard status == .authorized else { return }
+            AVAudioApplication.requestRecordPermission { granted in
+                guard granted else { return }
+                Task { @MainActor in if self.held { self.begin() } }
+            }
+        }
+    }
+
+    func stop() {
+        held = false
+        guard listening else { return }
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        request?.endAudio()
+        // The final result normally follows within a beat; never wait on it for long.
+        let this = run
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            if self.run == this { self.finish() }
+        }
+    }
+
+    private func begin() {
+        guard !listening, let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { return }
+        do {
+            // ponytail: takes the app's one audio session to .playAndRecord while the finger is down, so the
+            // Mac's sound ducks for that time; give it back to .playback after. A shared holder if that grates.
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+            try session.setActive(true)
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            request.shouldReportPartialResults = true
+            request.addsPunctuation = true
+            if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+            let input = engine.inputNode
+            input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buffer, _ in
+                request.append(buffer)
+            }
+            engine.prepare()
+            try engine.start()
+            self.request = request
+            partial = ""
+            listening = true
+            run += 1
+            let this = run
+            task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+                let text = result?.bestTranscription.formattedString
+                let done = result?.isFinal == true || error != nil
+                Task { @MainActor in
+                    guard let self, self.run == this else { return }
+                    if let text { self.partial = text }
+                    if done { self.finish() }
+                }
+            }
+            // Let go before the prompts were answered and the engine ran.
+            if !held { stop() }
+        } catch {
+            print("dictation: \(error.localizedDescription)")
+            engine.inputNode.removeTap(onBus: 0)
+            restoreSession()
+        }
+    }
+
+    /// Hands over the phrase once and puts the audio session back.
+    private func finish() {
+        guard listening else { return }
+        listening = false
+        if engine.isRunning {
+            engine.stop()
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        task?.cancel()
+        task = nil
+        request = nil
+        let phrase = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        partial = ""
+        restoreSession()
+        deliver(phrase)
+    }
+
+    private func restoreSession() {
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
     }
 }
