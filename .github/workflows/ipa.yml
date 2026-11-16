@@ -1,0 +1,61 @@
+# An unsigned iPhone build packed as Sill.ipa, for sideloading (Sideloadly, AltStore), which signs it
+# with the installer's own Apple ID. Runs on a push to hide-top-bar and by hand; the file is an
+# artifact of the run. Nothing here signs anything or uses a secret.
+name: Unsigned IPA
+
+on:
+  push:
+    branches: [hide-top-bar]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Build Sill.ipa
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The iOS app needs the iOS 27.1 SDK, as in ci.yml.
+      - name: Select Xcode 27.1
+        uses: ./.github/actions/select-xcode
+        with:
+          version: '27.1'
+          allow-beta: 'true'
+
+      - name: Build for iPhone (Release, not signed)
+        run: |
+          xcodebuild -project iOSClient/Sill.xcodeproj -scheme Sill \
+            -destination 'generic/platform=iOS' -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Pack Sill.ipa
+        run: |
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/Sill.app"
+          test -d "$app"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$app" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/Sill.ipa" Payload)
+          ls -l Sill.ipa
+
+      - name: Upload Sill.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sill-ipa
+          path: Sill.ipa
+          retention-days: 30
